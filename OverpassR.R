@@ -12,11 +12,11 @@ library(dplyr)
 library(plyr)
 
 #Read the wrs tiles 
-wrs <- st_read('data/in/wrs2_asc_desc.shp')
+wrs <- st_read('Data/In/wrs2_asc_desc.shp')
 wrs <- wrs[wrs$MODE == 'D',]
 
 #Lookup table and array of dates
-lookup_table <- read.delim('data/in/lookup_table.txt')
+lookup_table <- read.delim('Data/In/lookup_table.txt')
 global <- reactiveValues(min_date = Sys.Date(), max_date = Sys.Date() + 16)
 
 #Global variable output table. It will update with each map click and reset only when 'reset map' button is clicked
@@ -32,18 +32,18 @@ ui <- fluidPage(
   
   fluidRow(
     column(12,
-           DTOutput('table' ),
+           DTOutput('table' )#,
     ),
     
     column(12, offset = 8,
            dateRangeInput("dates", "Date range:",
                           start = Sys.Date(),
-                          end = Sys.Date()+16),
+                          end = Sys.Date()+16)#,
     ),
     
     column(12, offset = 8, 
-           actionButton('applyDates', "Apply Date Filter"),
-    ),
+           actionButton('applyDates', "Apply Date Filter")#,
+    )#,   
   )  
 )
 
