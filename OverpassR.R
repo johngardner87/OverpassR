@@ -1,9 +1,7 @@
-#All packages used at some point in the project - will narrow down at the end
 library(shiny)
 library(leaflet)
 library(sf)
 library(tidyverse)
-library(RColorBrewer)
 library(sp)
 library(rgdal)
 library(lubridate)
@@ -11,19 +9,51 @@ library(DT)
 library(plyr)
 library(dplyr)
 
+library(xml2)
+library(rvest)
 
-#Read the wrs tiles 
-wrs <- st_read('data/in/wrs2_asc_desc.shp')
-wrs <- wrs[wrs$MODE == 'D',]
 
-#Lookup table and array of dates
-lookup_table <- read.delim('data/in/lookup_table.txt')
 
-#Global variable output table. It will update with each map click and reset only when 'reset map' button is clicked
+#  ============================ GLOBAL VARIABLES =======================================
+
+wrs <- st_read('Data/In/Landsat/wrs2_cleaned_datetime.shp') %>% filter(MODE == 'D')
+
+
+
+# Lookup tables for Landsat 7 and 8 dates
+ls8 <- read.csv('Data/In/Landsat/landsat8_lookup.csv') %>% cbind("Satellite" = "Landsat8")
+ls7 <- read.csv('Data/In/Landsat/landsat7_lookup.csv') %>% cbind("Satellite" = "Landsat7")
+
+#Used to select a table when toggling between satellites
+lookup_table <- list("Landsat8" = ls8, "Landsat7" = ls7)
+choices <- c("ls7", "ls8", "s2")
+
+#Acquisition swath and mgrs tiles for Sentinel2
+MGRS <- st_read('Data/In/Sentinel/Relevant_MGRS.shp')
+SWATHS <- st_read('Data/In/Sentinel/Swaths.kml', layer = "NOMINAL")
+
 global_table = data.frame()
+global_coords = data.frame()
+
+# Ensures landing page is displayed
+LAUNCHING <-  TRUE
 
 
 ui <- fluidPage(
+
+  tags$head(tags$style(
+    HTML(
+      '.modal.in .modal-dialog{
+        width:100%;
+        height:100%;
+        margin:0px;
+      }
+
+      .modal-content{
+        width:100%;
+        height:100%;
+      }'
+
   
   fixedRow(
     column(4, offset = 5,
@@ -33,269 +63,707 @@ ui <- fluidPage(
   fixedRow(
     column(10, offset = 3, 
            mainPanel("Click on map or enter coordinates to view satellite overpass information")
+
+    )
+  )),
+  titlePanel(tags$table(
+    id = "title-panel",
+    tags$tr(
+      tags$td(
+        style = "width: 25%",
+        img(src = "Cuahsi_logo.png",
+            style = "width: 100%; float: left")
+      ),
+      tags$td(style = "width: 13%"),
+      tags$td(style = "width: 24%", "Overpasser"),
+      tags$td(style = "width: 13%"),
+      tags$td(
+        style = "width: 25%",
+        img(src = "UNC_logo_flat.png",
+            style = "width: 80%; height 80%; float: right")
+      )
+    )
+  )),
+  
+  
+  tags$head(tags$style(
+    HTML(
+      " #inputs-table  {
+          border-collapse: collapse;
+        }
+        #inputs-table td {
+          padding: 5px;
+          vertical-align: bottom;
+        }"
+    )
+  )),
+  
+  #Upper menu with dates, coord search, and satellite dropdown
+  wellPanel(
+    class = "col-md-11.5",
+    style = "margin: 20px 10px 20px 10px",
+    tags$table(
+      id = "inputs-table",
+      style = "width: 100%",
+      tags$tr(
+        tags$td(
+          style = "width: 10%",
+          textInput(
+            "lat",
+            label = "Coordinates:",
+            value = "",
+            placeholder = "Lat"
+          )
+        ),
+        tags$td(
+          style = "width: 10%",
+          textInput(
+            "lon",
+            label = NULL ,
+            value = "",
+            placeholder = "Lon"
+          )
+        ),
+        tags$td(
+          style = "width: 5%",
+          div(class = "form-group shiny-input-container",
+              actionButton("find", label = "Find"))
+        ),
+        tags$td(style = "width: 8%"),
+        tags$td(
+          style = "width: 33%; text-align: center",
+          dateRangeInput(
+            "dates",
+            "Date range:",
+            start = Sys.Date(),
+            end = Sys.Date() + 16,
+            min = "1999-05-15"
+          ),
+          span(textOutput('helpText'), style = "color:red")
+        ),
+        tags$td(style = "width: 8%"),
+        tags$td(
+          style = "width: 20%",
+          selectInput(
+            'timezone',
+            "Timezone",
+            choices = OlsonNames() %>% as.character(),
+            selected = "GMT"
+          )
+        ),
+        
+        tags$td(style = "width: 8%"),
+        tags$td(
+          style = "width: 25%",
+          checkboxGroupInput(
+            "satellite",
+            label = "Satellite:",
+            choices = c(
+              "Landsat7" = "ls7",
+              "Landsat8" = "ls8",
+              "Sentinel2" = "s2"
+            ),
+            selected = "ls7"
+          )
+        )
+        
+      )
     )
   ),
   
-  leafletOutput('map', width = 1000, height = 500),
-  
-  fluidRow(
-    column(1, offset = 0, actionButton("refreshButton", "Reset")),
-    uiOutput("ui")
-  ),
-  
-  #Row with coordinate input, date input, search
-  fixedRow(
-    
-    column(2, offset = 1,
-           textInput("lat", label = NULL , value = "", placeholder = "Lat", width = 130)
-    ),
-    column(2,
-           textInput("lon", label = NULL , value = "", placeholder = "Lon", width = 130)
-    ),
-    
-    column(1, offset = 0, 
-           actionButton("find", label = "Find")
-    ),
-    
-    column(3, offset = 2,
-           dateRangeInput("dates", "Date range:",
-                          start = Sys.Date(),
-                          end = Sys.Date()+16)
+  # Map and help button
+  wellPanel(
+    tags$table(
+      id = "leaflet-table",
+      style = "width: 100%",
+      actionButton(inputId = "help_button", "", icon = icon("question-circle")),
+      tags$tr(
+        tags$td(style = "width: 8%"),
+        tags$td(style = "width: 84%",
+                leafletOutput('map', height = 550)),
+        tags$td(style = "width: 8%")
+      )
     )
   ),
   
-  #Apply Date Button
-  fixedRow( 
-    column(1, offset = 8,
-           actionButton('applyDates', "Apply Date Filter")
-    )
-  ),
+  # Download, refresh, and output table
+  tags$table(tags$tr(
+    tags$td(style = "width: 75%"),
+    tags$td(style = "width: 5%",
+            actionButton("refreshButton", " Reset ")),
+    tags$td(style = "width: 10%",
+            downloadButton('download', "Download"))
+  ), ),
   
-  fluidRow(
-    DTOutput('table')
-  ),
+  DTOutput('table'),
   
-  fixedRow(
-    mainPanel(" ")
-  ),
-  
-  fixedRow(
-    column(1, offset = 8, 
-           downloadButton('download', "Download") )
-  )
 )
 
 
+#  ========================================== SERVER  ===============================================
 
-server <- function(input, output, session){
-  
+server <- function(input, output, session) {
   proxy_table = dataTableProxy('table')
   proxyMap <- leafletProxy("map")
   
   
-  #Render map with base layers WorldImagery and Labels
+  # ====== Help dialogue / landing page ======
+  observe({
+    if (!is.null(input$help_button) || LAUNCHING) {
+      LAUNCHING <<- FALSE
+      relativ_date <-
+        SWATHS$begin %>% as.Date() %>% max() %>% as.character()
+      
+      showModal(modalDialog(
+        footer = modalButton("Go"),
+        h1('Welcome to Overpasser! (beta)'),
+        tags$p(
+          tags$br(),
+          tags$blockquote(
+            "Overpasser was designed for integrating satellite remote sensing and field data collection. It is an interactive tool that
+                           visualizes the location and footprint of satellite overpasses (or tiles, such as Landsat 7, 8, and Sentinel 2A/B) as well
+                          as date/times. OverpassR can help researchers plan field campaigns during satellite overpasses as well as to simply visualize
+                          the spatial and temporal coverage of satellite images over study areas."),
+          tags$br(),
+          tags$blockquote(
+            tags$b("Directions:"),
+            tags$ol(
+              tags$li("Select your preferred satellites."),
+              tags$li(
+                "Click on the map (in as many locations as desired) or manually enter coordinates to see overpass locations on map and a table of dates.
+              (The table can be interactively sorted by different columns by clicking the header)."),
+              tags$li(
+                "Click the “Download” button at the bottom to generate a .csv file of the table of overpass dates."),
+              
+              tags$li("Hit “Reset” to clear selections and start over.")
+            )
+          ),
+          tags$i(
+            tags$p(
+              "Please send bug reports to the Lead Developer, Andrew Buchanan at the email address below.
+                          Contact Simon Topp and John Gardner with feedback on current or desired future functionality."),
+            p("Lead Developer: Andrew Buchanan (ajb28@live.unc.edu)."),
+            p("Project Guidance: Simon Topp (sntopp@live.unc.edu), John Gardner (johngardner87@gmail.com), and Tamlin Pavelsky.")
+          ),
+          tags$b(
+            tags$a(href = "http://uncglobalhydrology.org/", "Global Hydrology Lab")
+          )
+        ),
+        tags$hr(),
+        tags$p(
+          tags$b("Resources:"),
+          tags$ol(
+            tags$li("Landsat: "),
+            tags$i(
+              tags$a(href = "https://github.com/yhhjo/OverpassR/blob/feature-ls-times/Data/In/Landsat/wrs2_cleaned_datetime.shp", "WRS shapefile & acquisition times"),
+              br(),
+              tags$a(href = "https://landsat.usgs.gov/landsat_acq", "Acquisiton dates")
+            ),
+            tags$li("Sentinel: "),
+            tags$i(
+              tags$a(href = "https://hls.gsfc.nasa.gov/wp-content/uploads/2016/03/S2A_OPER_GIP_TILPAR_MPC__20151209T095117_V20150622T000000_21000101T000000_B00.kml", "MGRS tiles"),
+              br(),
+              tags$a(href = "https://github.com/yhhjo/OverpassR/blob/feature-ls-times/Data/In/Sentinel/Swaths.kml", 
+                     paste0("Datetime acquisition swath .kml for ", 
+                             SWATHS$begin %>% as.Date() %>% min() %>% as.character(),  " to ", 
+                             SWATHS$begin %>% as.Date() %>% max() %>% as.character())
+                     ),
+            )
+          )
+        )
+      ))
+      get_swaths()
+    }
+  })
+  
+  
+  # ====== Render map with WorldImagery and Labels as base ======
   output$map <- renderLeaflet({
-    
-    leaflet() %>%
-      addTiles(group = "Default") %>%
+    leaflet(options = leafletOptions(minZoom = .75)) %>%
+      setMaxBounds(
+        lng1 = 180,
+        lat1 = 90,
+        lng2 = -180,
+        lat2 = -90
+      ) %>%
+      addTiles(group = "Standard") %>%
       addProviderTiles(providers$Esri.WorldImagery, group = "Satellite") %>%
       addProviderTiles(providers$CartoDB.VoyagerOnlyLabels, group = "Satellite") %>%
-      setView(lat=10, lng=0, zoom=2)  %>%
+      addProviderTiles(providers$Esri.WorldPhysical, group = "Relief") %>%
+      addProviderTiles(providers$Esri.DeLorme, group = "Topographic") %>%
+      setView(lat = 10,
+              lng = 0,
+              zoom = 2)  %>%
       addLayersControl(
-        baseGroups = c("Default", "Satellite"),
-        options = layersControlOptions(collapsed = FALSE)
+        baseGroups = c("Satellite", "Standard", "Relief", "Topographic"),
+        options = layersControlOptions(collapsed = TRUE)
+      ) %>%
+      addLegend(
+        position = "bottomright",
+        colors = c('red', 'blue'),
+        labels = c("Sentinel", "Landsat"),
+        opacity = .5,
+        title = "Tiles"
       )
+    
   })
   
   
-  observeEvent(input$find,{
+  # ====== Handle timezone changes ======
+  observeEvent(input$timezone, {
+    if (is_empty(global_coords)) {
+      return()
+    }
     
+    for (i in 1:length(global_table$Time)) {
+      if (is.na(global_table$Time[i])) {
+        next
+      } else {
+        global_table$Time[i] <<-
+          paste0(global_table$Date[i], global_table$Time[i]) %>% as.POSIXct() %>%
+          strftime(format = "%H:%M:%S",
+                   tz = input$timezone,
+                   usetz = TRUE) %>% as.character.Date()
+      }
+    }
+    display_global()
+  })
+  
+  
+  # ====== Manually entered coordinate search ======
+  observeEvent(input$find, {
     lon <- input$lon %>% as.numeric()
     lat <- input$lat %>% as.numeric()
-    validate(
-      need((validCoords(lon, lat)), "Enter valid coordinates")
-    )
     
-    generate(lon, lat)
+    if (!validCoords(lon, lat)) {
+      output$helpText <-
+        renderText("Enter valid coordinates. High tile density in poles limites latitude to (-82,82)")
+      return()
+    }
+    
+    global_coords <<-
+      rbind(global_coords, cbind("Long" = lon, "Lat" = lat)) %>% distinct()
+    
+    # Calls generate and generateS2 based on which satellites are selected in input
+    handleNewCoords(lon, lat)
+    
+    
   })
   
   
-  observeEvent(input$map_click,{
+  # ======  Retroactive satellite changes ====== 
+  observeEvent(input$satellite, {
     
-    if(is.null(input$map_click))
-      return() 
+    #Ignore if this is't retroactive
+    if (is_empty(global_coords)) {
+      return()
+    } 
+    global_table <<- data.frame()
+    leafletProxy("map") %>% clearShapes()
     
-    #clean up
+    # Repopulate cleared data table and map
+    for (r in 1:nrow(global_coords)) {
+      handleNewCoords(global_coords$Long[r], global_coords$Lat[r])
+    }
+  })
+  
+  
+  # ====== Handle user map clicks ======
+  observeEvent(input$map_click, {
+    if (is.null(input$map_click)) {
+      return()
+    }
+
     click <- input$map_click
     lon <- click$lng
     lat <- click$lat
     
-    generate(lon, lat)
+    global_coords <<- rbind(global_coords, cbind("Long" = lon, "Lat" = lat)) %>% distinct()
     
+    handleNewCoords(lon, lat)
   })
   
   
-  #Use a separate observer to clear shapes and output table if "clear tiles" button clicked
-  observeEvent(input$refreshButton,{
+  # ====== Refresh button: use proxy map to clear tiles ======
+  observeEvent(input$refreshButton, {
     
-    if(is.null(input$refreshButton))
-      return()
-    
-    proxyMap%>% clearShapes()
-    
-    updateDateRangeInput(session, "dates", "Date range:",
-                         start = Sys.Date(), end = Sys.Date()+16)
+    proxyMap %>% clearShapes() %>% clearMarkers()
+    output$helpText <- renderText({
+      
+    })
+    updateDateRangeInput(session,
+                         "dates",
+                         "Date range:",
+                         start = Sys.Date(),
+                         end = Sys.Date() + 16)
     
     output$table <- renderDT(NULL)
-    global_table <<- NULL
-    
-  }
-  )
+    global_table <<- data.frame()
+    global_coords <<- data.frame()
+  })
   
-  #Updates map with tiles and global table with data given coordinates of a click
-  generate <- function(lon, lat){
-    
-    df <- returnPR(lon, lat, wrs)
-    paths <- df$path
-    rows <- df$row
-    tile_shapes <- df$shape.geometry
-
-    #Shape file of tiles that intersect
-    reference_date <- lookup_table[paths,]$Overpass
-    
-    #Handles if date filter is applied  
-    if(input$applyDates){
-      
-      
-      validate(
-        need( (as.numeric(input$dates[2] - input$dates[1]) >=16), message =  "Please enter valid date range") 
-      )
-      
-      start_date <- input$dates[1]
-      end_date <- input$dates[2]
-      
-      days_til <- (as.numeric(start_date - reference_date)) %% 16
-      next_pass <- (start_date + days_til) %>% as.Date()
-      
-      len <- 1:length(next_pass)
-      updating_table <- NULL
-      
-      #Each loop iteration creates a data frame "temp" of dates, path, row, lat, lon for one tile
-      ## Subseqeuent iterations create a temp data frame, then append the new data frame to the previous one
-      for (r in len){
-        dates <- seq.Date(next_pass[r], to = end_date, by = 16) %>% as.character()
-        temp <- cbind("Date" = dates, "Path" = paths, "Row" = rows, "Lat" = lat, "Long" = lon)
-        updating_table <- rbind(updating_table, temp)
-      }
-      
-      
-    }
-    
-    #No date filter
-    else{
-      
-      
-      days_til <- (as.numeric(Sys.Date()) - reference_date) %% 16
-      next_pass <- (Sys.Date() + days_til) %>% as.character.Date()
-      
-      #Table with all of the data from the map click
-      updating_table <-  cbind("Date" = next_pass, "Path" = paths, 
-                               "Row" = rows, "Lat" = lat, "Long" = lon) %>% as.data.frame()
-      
-      #Fixes a bug that would give manually entered coordinates with no tile 
-      #a place on the output table, throwing a rbind error
-      if(is.null(updating_table$Date))
-        return()
-      
-    }
-    
-    #Renders distinct output
-    if(!is.null(global_table)){
-      global_table <<- rbind(updating_table, global_table)
-      x <- duplicated(global_table[,1:3])
-      global_table <<- global_table[!x,]
-    }
-    
-    else
-      global_table <<- updating_table
-    
-    #Display table
-    output$table <<- renderDT(
-      global_table, options = list(paging = FALSE, searching = FALSE, info = FALSE) 
-    )
-    
-    #Update the map: clear all tiles, then add only the ones that overlap in Red
-    leafletProxy("map") %>%
-      addTiles(group = "Default") %>%
-      addProviderTiles(providers$Esri.WorldImagery, group = "Satellite") %>%
-      addProviderTiles(providers$CartoDB.VoyagerOnlyLabels, group = "Satellite") %>%
-      setView(lng = lon , lat = lat, zoom = 6) %>%
-      addPolygons(
-        data = tile_shapes, color = 'blue', weight = 1, 
-        highlightOptions = highlightOptions(color = 'black', weight = 3, bringToFront = TRUE), 
-        label = row_number(global_table$Path)) %>%
-      addLayersControl(
-        baseGroups = c("Default", "Satellite"),
-        options = layersControlOptions(collapsed = TRUE))
-  }
   
+  # ====== Retroactively update output table with a new date filter ======
+  observeEvent(input$dates, {
+    if (is.null(input$dates))
+      return()
+    
+    if (!validDates() | is_empty(global_coords)) {
+      return()
+    } else {
+      output$helpText <- renderText({})
+    }
+    
+    #Clear output table and global table. Re-populate with global coords
+    output$table <- renderDT(NULL)
+    global_table <<- data.frame()
+    leafletProxy("map") %>% clearShapes()
+    
+    for (r in 1:nrow(global_coords)) {
+        handleNewCoords(global_coords$Long[r], global_coords$Lat[r])
+    }
+  })
+  
+  # ====== Observes download button ======
   output$download <- downloadHandler(
     filename = "overpassR.csv",
-    content = function(file){
+    content = function(file) {
       write.csv(global_table, file, row.names = TRUE)
     }
   )
+  
+  
+  # ============ Server Helper Functions ============
+  
+  
+  # ====== SENTINEL2 ======
+  ## Given coordinates, display the footprints of MGRS tiles and update the output table
+  generateS2 <- function(lon, lat) {
+    start <- input$dates[1] %>% as.Date()
+    stop <- input$dates[2] %>% as.Date()
+    click <-
+      cbind(lon, lat) %>% as.data.frame() %>% SpatialPoints() %>% st_as_sf(coords = c('lon', 'lat'))
+    st_crs(click) = 4326
+    
+    #Swaths and mgrs that contain click
+    swaths <- SWATHS[st_intersects(click, SWATHS, sparse = FALSE),]
+    swaths$begin <- swaths$begin %>% ymd_hms()
+    mgrs <- MGRS[st_intersects(click, MGRS, sparse = FALSE),]
+    output_table <- data.frame()
+    
+    if (is_empty(swaths$begin) | is_empty(mgrs)) {
+      map(lon, lat)
+      output$helpText <-
+        renderText(
+          "Sentinel2 captures images over land. Some coordinates did not yield overpass information"
+        )
+      return(NULL)
+    }
+    
+    #Update the map
+    map(lon, lat) %>%  addPolygons(
+      data = mgrs,
+      color = 'red',
+      weight = 2,
+      label = paste0('ID: ', mgrs$Name),
+      highlightOptions = highlightOptions(
+        color = 'white',
+        weight = 3,
+        bringToFront = TRUE
+      )
+    )
+    
+    
+    # Find the whole number of days between the swath's reference datetime and the start of the user's selected range (date).
+    daterange_offset <- (difftime(swaths$begin, start) %>% as.integer() %% 5) %>% ddays()
+    dates <-  start + daterange_offset
+    datetimes <- data.frame()
+    times <-
+      strftime(
+        swaths$begin,
+        format = "%H:%M:%S",
+        tz = input$timezone,
+        usetz = TRUE
+      ) %>% as.character.Date()
+    
+    
+    #Positive date range, but too narrow
+    if (any(dates > stop)) {
+      output$helpText <-
+        renderText("Date range too narrow for some overpasses. Try a range of at least 5 days.")
+      return()
+    }
+    
+    for (i in 1:length(dates)) {
+      x <- seq.Date(dates[i], stop, 5)
+      x <- data.frame("Date" = x[x <= stop]) %>% as.character.Date()
+      datetimes <- rbind(datetimes, merge(x, times[i]))
+    }
+    
+    names(datetimes) <-  c("Date", "Time")
+    
+    output <- datetimes %>% as.character.Date() %>% merge(mgrs$Name)
+    names(output) <- c("Date", "Time" , "MGRS")
+    output <-
+      cbind(
+        output,
+        "Path" = NA,
+        "Row" = NA,
+        "Lat" = lat,
+        "Lon" = lon,
+        "Satellite" = "Sentinel2"
+      ) %>% unique() %>% update_output()
+  }
+  
+  
+  # ====== LANDSAT 7 & 8 ======
+  ## Given coordinates and either LS8 or LS7 lookup table, update map with overlapping WRS tiles and output table
+  generate <- function(lon, lat, ref) {
+    df <- returnPR(lon, lat)
+    start <- input$dates[1] %>% as.numeric()
+    stop <- input$dates[2] %>% as.numeric()
+    
+    #Update the map
+    map(lon, lat) %>%  addPolygons(
+      data = df$geometry,
+      color = 'blue',
+      weight = 2,
+      label = paste0('Path: ', df$PATH, '; Row: ', df$ROW),
+      highlightOptions = highlightOptions(
+        color = 'white',
+        weight = 3,
+        bringToFront = TRUE
+      )
+    )
+    
+    #Create range of dates from start - end
+    range <- start:stop %>% as.Date('1970-01-01') %>% as.character()
+    
+    # What cycle, 1-16, is the first day in the date range
+    start_date_cycle <- start - (ref$Cycle_Start[1] %>% as.Date() %>% as.numeric()) %% 16 + 1
+    
+    #Lookup table where every date in range has corresponding cycle
+    table <- cbind("Date" = range, "Cycle" = getCycles(1, 16, length(range), start_date_cycle - 1)) %>% as.data.frame()
+    
+    if (ref$Satellite[[1]] == "Landsat8") {
+      times <- df$L8_Time
+    } else {
+      times <- df$L7_Time
+    }
+    
+    updating_table <- data.frame()
+    
+    for (r in 1:length(df$PATH)) {
+      cycle <- ref[ref$Path == df$PATH[r],]$Cycle
+      dates <- table[table$Cycle == cycle,]$Date %>% as.character()
+      
+      if (is_empty(dates)) {
+        next
+      } else if (!is.na(times[r])) {
+        time <- paste0(Sys.Date(), times[r]) %>% as.POSIXct() %>% 
+                  strftime(format = "%H:%M:%S", tz = input$timezone, usetz = TRUE) %>% as.character.Date()
+      } else {
+        time <- NA
+      }
+      
+      updating_table <-
+        rbind(updating_table,
+          cbind(
+            "Date" = dates,
+            "Time" = df$L7_Time[r],
+            "Path" = df$PATH[r],
+            "Row" = df$ROW[r],
+            "MGRS" = NA,
+            "Lat" = round(lat, 5),
+            "Lon" = round(lon, 5),
+            "Satellite" = (ref$Satellite[[1]] %>% as.character())
+          )
+        )
+    }
+    update_output(updating_table)
+  }
+  
+  
+  # ====== Calls appropriate generate functions with a given coordinate depending on satellite selection ======
+  handleNewCoords <- function(lon, lat) {
+    if (any(input$satellite == "s2")) {
+      generateS2(lon, lat)
+    }
+    
+    if (any(input$satellite == "ls7")) {
+      generate(lon, lat, ls7)
+    }
+    
+    if (any(input$satellite == "ls8")) {
+      generate(lon, lat, ls8)
+    }
+  }
+  
+  
+  # ====== Updates map with user's latest click ======
+  map <- function(lon, lat) {
+    return(
+      leafletProxy("map") %>%
+        addTiles(group = "Default") %>%
+        addProviderTiles(providers$Esri.WorldImagery, group = "Satellite") %>%
+        addProviderTiles(providers$CartoDB.VoyagerOnlyLabels, group = "Satellite") %>%
+        addProviderTiles(providers$Esri.WorldPhysical, group = "Relief") %>%
+        addProviderTiles(providers$Esri.DeLorme, group = "Topographic") %>%
+        addMarkers(
+          lng = lon,
+          lat = lat,
+          label = paste0('Lat ', round(lat, 2), '; Lon: ', round(lon, 2))
+        ) %>%
+        addLayersControl(
+          baseGroups = c("Satellite", "Standard", "Relief", "Topographic"),
+          options = layersControlOptions(collapsed = TRUE)
+        )
+    )
+  }
+  
+  
+  # ====== Processes a data frame to be added to the output table ======
+  update_output <- function(append) {
+    if (is_empty(append)) {
+      output$helpText <- renderText("No overpass in selected date range")
+      return()
+    } else {
+      output$helpText <- renderText({})
+    }
+    
+    #Renders distinct output
+    if (!is_empty(global_table)) {
+      global_table <<- rbind(append, global_table) %>% as.data.frame()
+      global_table <<-
+        global_table[!duplicated(global_table[, 1:4]),]
+    } else {
+      global_table <<- append %>% as.data.frame()
+    }
+    display_global()
+  }
+  
+  
+  # ====== Displays the global output table ======
+  display_global <- function() {
+    output$table <<- renderDT(datatable(
+      global_table,
+      rownames = NULL,
+      options = list(
+        paging = FALSE,
+        searching = FALSE,
+        info = FALSE,
+        orderClasses = TRUE,
+        order = list(0, 'asc')
+      )
+    ) %>%
+      formatRound(c(6:7), 2))
+  }
+  
+  
+  # ====== Returns whether dates are a valid range. Handles error message ======
+  validDates <- function() {
+    if (input$dates[1] >= input$dates[2]) {
+      output$helpText <- renderText("Please select a positive date range")
+      return(FALSE)
+    } else {
+      output$helpText <- renderText({
+        
+      })
+      return(TRUE)
+    }
+  }
+  
+  
+  # ====== WEB SCRAPER ======
+  # This function goes to ESA's website containing Sentinel Acquisition Plans, downloads the kml, and replaces the old one locally
+  # Required conditions: existing local acquisition plan's latest referenced date in $begin attribute is at least 11 prior to today
+  # Error handling: If error or warning is raised, the local plan will not be replaced and an error message is displayed, prompting
+  # user to report bug to ajb28@me.com.
+  
+  get_swaths <- function() {
+    # Fetch if today is more than 10 days over the latest acquisition SWATH
+    if (!(SWATHS$begin %>% as.Date() %>% max() - today()) < -10) {
+      return()
+    } else {
+      out <- tryCatch({
+        url <-
+          'https://sentinel.esa.int/web/sentinel/missions/sentinel-2/acquisition-plans'
+        
+        # Pull HTML and CSS source code
+        page <- read_html(url)
+        
+        # Pulls specific attribute within webpage that contains the latest sentinel-2a acquisition swath URL extension
+        link <-
+          (page %>% html_nodes(".sentinel-2a") %>% html_nodes("a"))[1] %>% as.character()
+        
+        # Regex: match everything between "/d" and .kml on the hyperlink attribute
+        regex <- "/d(.*)\\.kml"
+        
+        # Extracts the extension
+        extension <- regmatches(link, regexpr(regex, link))
+        url <- paste0("https://sentinel.esa.int", extension)
+        
+        # Download kml as temp file
+        download.file(url, "temp.kml")
+        stopifnot(file.rename("temp.kml", "./Data/In/Sentinel/Swaths.kml"))
+        
+        # Update local data
+        SWATHS <<-
+          st_read("Data/In/Sentinel/Swaths.kml", layer = "NOMINAL")
+      },
+      
+      # === WARNING HANDLING ===
+      warning = function(cond) {
+        output$helpText <-
+          renderText(
+            "A warning flag was raised while updating ESA Sentinel 2 Database. Please report this bug to ajb28@live.unc.edu "
+          )
+      },
+      
+      # === ERROR HANDLING  ===
+      error = function(cond) {
+        output$helpText <-
+          renderText(
+            "An error occurred connecting to ESA Sentinel 2 Database. Please report this bug to ajb28@live.unc.edu "
+          )
+      })
+    }
+  }
 }
 
 
-#Helper methods---------------------------------------------------------------------------------------------------
+# ============ Generic helpers ============
 
-
-#Helper method takes lon, lat, shapefile, and returns PR of intersected tiles 
-returnPR <- function(lon, lat, shapefile){
-  
-  #Validate input.
-  #PROBLEM: Why is shiny not rendering this output message? 
-  validate(
-    need(validCoords(lon, lat), "Enter valid coordinates")
-  )
-  
-  coords <- as.data.frame(cbind(lon, lat)) 
+# ====== Takes lon, lat, shapefile, and returns PR of intersected tiles ======
+returnPR <- function(lon, lat) {
+  coords <- as.data.frame(cbind(lon, lat))
   point <- SpatialPoints(coords)
-  proj4string(point) <- CRS("+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs")
+  proj4string(point) <-
+    CRS("+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs")
   
   #Convert the point to a shape file so they can intersect
   pnt <-  st_as_sf(point, coords = c('lon' , 'lat'))
   
-  #Create a boolean matrix of all the polygons that intersect pnt (a user's mapclick)
-  ## And select those polygons from WRS
-  bool_selector <- st_intersects(shapefile, pnt, sparse = FALSE)
-  tiles <- (shapefile[bool_selector,])
-  paths <-  tiles$PATH
-  rows <- tiles$ROW
-  
-  return(data.frame("path" = paths, "row" = rows, "shape" = tiles))
+  bool_selector <- st_intersects(wrs, pnt, sparse = FALSE)
+  return(wrs[bool_selector,])
   
 }
 
-
-validCoords <- function(lon, lat){
-  
-  if(is.null(lon) | is.null(lat)
-     | is.na(lon) | is.na(lat))
+# ====== Validates coordinate clicks ======
+validCoords <- function(lon, lat) {
+  if (is.null(lon) | is.null(lat)
+      | is.na(lon) | is.na(lat))
     return(FALSE)
   
-  return(
-    (lat>=-90 && lat<=90) && 
-      (lon>=-180 && lon<=180)
-  )
+  return((lat > -82 && lat < 82) &&
+           (lon >= -180 && lon <= 180))
   
-} 
+}
 
-
-
-
-
-
+# ====== Genrates sequence of Landsat overpass cycles ======
+getCycles <- function(from, to, len, offset = 0) {
+  cycles <- rep(1:16, length.out = (len + offset))
+  return(cycles[(1 + offset):length(cycles)])
+}
 
 shinyApp(ui, server)
